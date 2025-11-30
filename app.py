@@ -51,6 +51,20 @@ def get_binance_price(symbol='BTCUSDT'):
     except Exception as e:
         return None
 
+def get_all_binance_prices():
+    try:
+        response = requests.get(
+            f'{BINANCE_BASE_URL}/api/v3/ticker/price',
+            timeout=5
+        )
+        data = response.json()
+        prices = {}
+        for item in data:
+            prices[item['symbol']] = float(item['price'])
+        return prices
+    except Exception as e:
+        return {}
+
 def calculate_safety_score(trader):
     score = 0
     if trader.get('verified', False):
@@ -79,7 +93,7 @@ def home():
 @app.route('/api/status')
 def get_status():
     return jsonify({
-        'binance_connected': bool(BINANCE_API_KEY),
+        'binance_connected': bool(BINANCE_API_KEY and BINANCE_SECRET_KEY),
         'ai_connected': bool(GEMINI_API_KEY),
         'demo_balance': demo_account['balance'],
         'timestamp': datetime.now().isoformat()
@@ -111,6 +125,76 @@ def reset_demo():
     }
     return jsonify({'success': True, 'message': 'Demo account reset'})
 
+@app.route('/api/account/real')
+def get_real_account():
+    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
+        return jsonify({'error': 'Binance API not configured', 'balance': 0})
+    
+    try:
+        timestamp = get_timestamp()
+        query_string = f'timestamp={timestamp}'
+        signature = create_signature(query_string, BINANCE_SECRET_KEY)
+        
+        response = requests.get(
+            f'{BINANCE_BASE_URL}/api/v3/account',
+            params={
+                'timestamp': timestamp,
+                'signature': signature
+            },
+            headers={'X-MBX-APIKEY': BINANCE_API_KEY},
+            timeout=10
+        )
+        
+        data = response.json()
+        
+        if 'balances' in data:
+            balances = {}
+            total_usd = 0
+            
+            prices = get_all_binance_prices()
+            
+            for asset in data['balances']:
+                free = float(asset['free'])
+                locked = float(asset['locked'])
+                total = free + locked
+                
+                if total > 0:
+                    symbol = asset['asset']
+                    usd_value = 0
+                    
+                    if symbol == 'USDT':
+                        usd_value = total
+                    elif symbol == 'BUSD':
+                        usd_value = total
+                    elif f"{symbol}USDT" in prices:
+                        usd_value = total * prices[f"{symbol}USDT"]
+                    
+                    balances[symbol] = {
+                        'free': free,
+                        'locked': locked,
+                        'total': total,
+                        'usd_value': round(usd_value, 2)
+                    }
+                    total_usd += usd_value
+            
+            return jsonify({
+                'mode': 'real',
+                'balances': balances,
+                'total_usd': round(total_usd, 2),
+                'timestamp': datetime.now().isoformat()
+            })
+        else:
+            return jsonify({
+                'error': data.get('msg', 'Unknown error'),
+                'balance': 0
+            })
+    
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'balance': 0
+        })
+
 @app.route('/api/price/<symbol>')
 def get_price(symbol):
     price = get_binance_price(symbol.upper())
@@ -124,7 +208,7 @@ def get_price(symbol):
 
 @app.route('/api/prices')
 def get_prices():
-    symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT']
+    symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT']
     prices = {}
     for symbol in symbols:
         price = get_binance_price(symbol)
@@ -287,15 +371,75 @@ def demo_trade():
         'balance': round(demo_account['balance'], 2)
     })
 
+@app.route('/api/trade/real', methods=['POST'])
+def real_trade():
+    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
+        return jsonify({'error': 'Binance API not configured'})
+    
+    data = request.json
+    trade_type = data.get('type', 'BUY').upper()
+    symbol = data.get('symbol', 'BTCUSDT')
+    amount = float(data.get('amount', 0))
+    
+    if amount <= 0:
+        return jsonify({'error': 'Invalid amount'})
+    
+    try:
+        timestamp = get_timestamp()
+        
+        if trade_type == 'BUY':
+            params = {
+                'symbol': symbol,
+                'side': 'BUY',
+                'type': 'MARKET',
+                'quoteOrderQty': amount,
+                'timestamp': timestamp
+            }
+        else:
+            params = {
+                'symbol': symbol,
+                'side': 'SELL',
+                'type': 'MARKET',
+                'quantity': amount,
+                'timestamp': timestamp
+            }
+        
+        query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+        signature = create_signature(query_string, BINANCE_SECRET_KEY)
+        params['signature'] = signature
+        
+        response = requests.post(
+            f'{BINANCE_BASE_URL}/api/v3/order',
+            params=params,
+            headers={'X-MBX-APIKEY': BINANCE_API_KEY},
+            timeout=10
+        )
+        
+        result = response.json()
+        
+        if 'orderId' in result:
+            return jsonify({
+                'success': True,
+                'order': result
+            })
+        else:
+            return jsonify({'error': result.get('msg', 'Order failed')})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
 @app.route('/api/signals')
 def get_signals():
+    btc_price = get_binance_price('BTCUSDT')
+    eth_price = get_binance_price('ETHUSDT')
+    
     signals = [
         {
             'id': 1,
             'symbol': 'BTCUSDT',
             'type': 'BUY',
             'confidence': 75,
-            'price': get_binance_price('BTCUSDT'),
+            'price': btc_price,
             'timestamp': datetime.now().isoformat()
         },
         {
@@ -303,11 +447,42 @@ def get_signals():
             'symbol': 'ETHUSDT',
             'type': 'HOLD',
             'confidence': 60,
-            'price': get_binance_price('ETHUSDT'),
+            'price': eth_price,
             'timestamp': datetime.now().isoformat()
         }
     ]
     return jsonify({'signals': signals})
+
+@app.route('/api/exchanges')
+def get_exchanges():
+    return jsonify({
+        'exchanges': [
+            {
+                'id': 'binance',
+                'name': 'Binance',
+                'connected': bool(BINANCE_API_KEY and BINANCE_SECRET_KEY),
+                'icon': '🟡'
+            },
+            {
+                'id': 'kucoin',
+                'name': 'KuCoin',
+                'connected': False,
+                'icon': '🟢'
+            },
+            {
+                'id': 'mexc',
+                'name': 'MEXC',
+                'connected': False,
+                'icon': '🔵'
+            },
+            {
+                'id': 'gate',
+                'name': 'Gate.io',
+                'connected': False,
+                'icon': '🟣'
+            }
+        ]
+    })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
